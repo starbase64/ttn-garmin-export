@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import math
+import re
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -23,19 +24,19 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QSplitter, QLayout, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView)
 from garminconnect import Garmin, GarminConnectTooManyRequestsError, GarminConnectAuthenticationError
 from catalog import DATASETS, ACTIVITY_DETAILS, selected_datasets, all_definitions
-from engine import Plan, Exporter, account_key, leaves, read_methods, substitute, field_patterns, MAX_WORKERS, atomic_json
+from engine import Plan, Exporter, account_key, leaves, read_methods, substitute, field_patterns, MAX_WORKERS, atomic_json, account_root
 from help_content import HELP
 from sports import FALLBACK_SPORTS, activity_type_keys, sport_label
 from activity_table import SOURCE_PATHS
 from preview import Previewer
 from failures import diagnostic, RatePause
 from archive import Archive,OfflineArchiveError,OfflineDataMissing
-from offline import ArchiveSync,OfflineExporter,OfflinePreviewer
+from offline import ArchiveSync,OfflineExporter,OfflinePreviewer,ArchiveExporter
 from sessionlog import SessionLog
 
 logging.getLogger('garminconnect').setLevel(logging.CRITICAL)
 logging.getLogger('curl_cffi').setLevel(logging.CRITICAL)
-VERSION = '0.5.1-preview'
+VERSION = '0.5.4-preview'
 # Lower bound for long archive syncs, even with a 0 s interval in the options.
 MIN_SYNC_INTERVAL = 0.25
 
@@ -93,6 +94,7 @@ class MainWindow(QMainWindow):
         self.sport_keys = list(FALLBACK_SPORTS)
         self.sports_loaded = False
         self.date_user_set = False
+        self.date_account=None;self.first_activity_date=None
         self.resize(1180, 870)
         self.setMinimumSize(900, 650)
         self.setWindowTitle('TTN Garmin Export · ' + VERSION)
@@ -185,6 +187,55 @@ class MainWindow(QMainWindow):
     @property
     def saved_account_path(self):return self.data_dir/'remembered-account.json'
 
+    def date_values(self,account):
+        if not account or self.demo:return {}
+        try:
+            path=self.data_dir/'date-preferences'/(account_key(str(account))+'.json')
+            values=json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(values,dict):return {}
+            result={}
+            for key in ('first_activity','export_from','data_from'):
+                value=values.get(key)
+                day=QDate.fromString(value,'yyyy-MM-dd') if isinstance(value,str) else QDate()
+                if day.isValid() and QDate(1990,1,1)<=day<=QDate.currentDate():result[key]=value
+            return result
+        except (OSError,ValueError,TypeError):return {}
+
+    def save_date_values(self,account,**changes):
+        if not account or self.demo:return
+        values=self.date_values(account);values.update(changes)
+        try:atomic_json(self.data_dir/'date-preferences'/(account_key(str(account))+'.json'),values)
+        except OSError:self.log.appendPlainText(self.tr('Datumsauswahl konnte nicht gespeichert werden. Schreibrechte prüfen.','Could not save date selection. Check write permissions.'))
+
+    def export_date_changed(self,*args):
+        self.date_user_set=True
+        self.save_date_values(self.date_account,export_from=self.start_date.date().toString('yyyy-MM-dd'))
+
+    def activate_date_account(self,account):
+        previous=self.date_account
+        if previous and previous!=account:
+            self.date_user_set=False
+            self.start_date.blockSignals(True);self.start_date.setDate(QDate.currentDate().addDays(-6));self.start_date.blockSignals(False)
+        self.date_account=account;values=self.date_values(account)
+        self.first_activity_date=values.get('first_activity')
+        self.reset_start_button.setEnabled(bool(self.first_activity_date))
+        chosen=values.get('export_from')
+        # A date changed before a manual login still takes precedence.
+        if chosen and not (previous is None and self.date_user_set):
+            self.start_date.blockSignals(True);self.start_date.setDate(QDate.fromString(chosen,'yyyy-MM-dd'));self.start_date.blockSignals(False)
+            self.date_user_set=True
+        elif self.first_activity_date and not self.date_user_set:
+            self.start_date.blockSignals(True);self.start_date.setDate(QDate.fromString(self.first_activity_date,'yyyy-MM-dd'));self.start_date.blockSignals(False)
+        if self.date_user_set:self.save_date_values(account,export_from=self.start_date.date().toString('yyyy-MM-dd'))
+        if self.data_page.date_account in (None,account):self.data_page.restore_date_filter(account)
+
+    def reset_activity_start(self):
+        if not self.first_activity_date:return
+        first=QDate.fromString(self.first_activity_date,'yyyy-MM-dd')
+        if self.end_date.date()<first:self.end_date.setDate(first)
+        self.start_date.setDate(first)
+        self.save_date_values(self.date_account,export_from=self.first_activity_date)
+
     def load_saved_account(self):
         try:
             saved=json.loads(self.saved_account_path.read_text(encoding='utf-8'))
@@ -192,6 +243,7 @@ class MainWindow(QMainWindow):
             if saved.get('schema')!=1 or not isinstance(email,str) or not email.strip() or len(email)>320 or type(china) is not bool:return
         except (OSError,ValueError,KeyError,TypeError):return
         self.email.setText(email);self.china.setChecked(china)
+        self.activate_date_account(account_key(email,china))
         auto_restore=saved.get('auto_restore',True) is True
         self.remember.setChecked(auto_restore)
         if not auto_restore:return
@@ -274,8 +326,11 @@ class MainWindow(QMainWindow):
         dates=QHBoxLayout()
         self.start_date=QDateEdit(QDate.currentDate().addDays(-6)); self.end_date=QDateEdit(QDate.currentDate())
         for d in (self.start_date,self.end_date): d.setCalendarPopup(True); d.setDisplayFormat('yyyy-MM-dd'); d.setMinimumDate(QDate(1990,1,1)); d.setMaximumDate(QDate.currentDate())
-        self.start_date.dateChanged.connect(lambda _:setattr(self,'date_user_set',True))
+        self.start_date.dateChanged.connect(self.export_date_changed)
         dates.addWidget(self.label('Von','From')); dates.addWidget(self.start_date); dates.addWidget(self.label('Bis einschließlich','Through')); dates.addWidget(self.end_date)
+        self.reset_start_button=self.button('Erste Aktivität','First activity',self.reset_activity_start)
+        self.reset_start_button.setEnabled(False);dates.addWidget(self.reset_start_button)
+        self.bind(self.reset_start_button,'Anfangsdatum auf die erste ermittelte Aktivität dieses Kontos zurücksetzen. Wird nach der Kontoabfrage verfügbar.','Reset start to the first detected activity of this account. Available after the account lookup.',setter='setToolTip')
         for count in (7,30,365):
             btn=self.button(f'{count} Tage',f'{count} days',lambda checked=False,n=count:self.quick_dates(n)); dates.addWidget(btn)
         main.addLayout(dates)
@@ -300,6 +355,9 @@ class MainWindow(QMainWindow):
         self.layout_combo=self.combo([('Langformat · Detailwerte','Long layout · leaf values','long'),('Breitformat · Datensätze','Wide layout · records','wide')]); self.row(form,'Tabellenaufbau','Table layout',self.layout_combo)
         self.activity_summary=self.check('Aktivitäten: eine Tabellenzeile pro Aktivität','Activities: one table row per activity',True); form.addRow(self.activity_summary)
         self.split=self.check('Dateien nach Jahr trennen','Split files by year',True); form.addRow(self.split)
+        self.export_history=self.check('Separate Exportordner behalten','Keep separate export folders');form.addRow(self.export_history)
+        form.addRow(self.label('Standard: ein aktueller Export pro Account unter exports/current. Ein neuer Export ersetzt dort die erzeugten Dateien. Heruntergeladene Daten bleiben im gemeinsamen Account-Bestand. Alte Exportordner bleiben erhalten.',
+                              'Default: one current export per account in exports/current. A new export replaces the generated files there. Downloaded data stays in the shared account archive. Existing export folders are retained.'))
         self.health_detail=self.combo([('Vollständige Messverläufe','Full measurement timelines','full'),('Tageskennzahlen (schneller)','Daily statistics (faster)','daily')])
         self.health_detail.currentIndexChanged.connect(self.update_health_labels)
         self.row(form,'Gesundheitsdaten','Health data',self.health_detail)
@@ -356,6 +414,9 @@ class MainWindow(QMainWindow):
         self.delay=QDoubleSpinBox(); self.delay.setRange(0,60); self.delay.setDecimals(2); self.delay.setSingleStep(0.1); self.delay.setValue(0.5); option_row('Abrufpause (Sekunden)','Request interval (seconds)',self.delay)
         self.workers=QSpinBox(); self.workers.setRange(1,MAX_WORKERS); self.workers.setValue(3); option_row('Parallele Abfragen','Parallel requests',self.workers)
         f.addWidget(self.label('Mehrere Abfragen laufen gleichzeitig; die Abrufpause gilt trotzdem für alle zusammen. Höhere Werte sind schneller, erhöhen aber das Risiko einer Garmin-Ratenbegrenzung (HTTP 429). Dann stoppt der Lauf und kann später fortgesetzt werden. Bereits gestartete Anfragen können noch zu Ende laufen.','Several requests run at the same time; the request interval still applies to all of them together. Higher values are faster but increase the risk of a Garmin rate limit (HTTP 429). The run then stops and can be resumed later. Requests already in flight may still finish.'))
+        self.skip_empty=self.check('Vermutlich leere Abfragen überspringen (experimentell)','Skip likely empty requests (experimental)',False);f.addWidget(self.skip_empty)
+        f.addWidget(self.label('Standard: aus. Leere Tageskennzahlen sind kein Beweis für fehlende Detaildaten. Übersprungenes bleibt ungeprüft und lässt sich unter Offline-Daten gezielt nachladen. Benötigt die Tagesübersicht; fehlende Felder werden normal abgefragt.',
+                               'Default: off. Empty daily statistics do not prove that detail data is absent. Skipped requests remain unverified and can be retrieved under Offline data. Requires daily summary; missing fields are requested normally.'))
         self.optimize=self.check('Zeitraumabfragen bündeln (empfohlen)','Batch supported date ranges (recommended)',True);f.addWidget(self.optimize)
         self.activity_batch_days=QSpinBox();self.activity_batch_days.setRange(1,365);self.activity_batch_days.setValue(31);option_row('Aktivitäten: Tage je Zeitraumabfrage','Activities: days per range query',self.activity_batch_days)
         self.health_batch_days=QSpinBox();self.health_batch_days.setRange(1,28);self.health_batch_days.setValue(28);option_row('Gesundheit: Tage je Zeitraumabfrage','Health: days per range query',self.health_batch_days)
@@ -466,6 +527,7 @@ class MainWindow(QMainWindow):
         actions=QHBoxLayout()
         self.sync_button=self.button('Alle unterstützten Daten sichern / ergänzen','Download / update all supported data',self.start_archive_sync,primary=True)
         actions.addWidget(self.sync_button);actions.addWidget(self.button('Gespeicherten Bestand prüfen','Inspect stored data',self.inspect_archive));v.addLayout(actions)
+        v.addWidget(self.button('Übersprungene Abfragen trotzdem laden','Retrieve skipped requests anyway',self.retrieve_skipped))
         v.addWidget(self.button('Nur gewählte Daten sichern / ergänzen','Download / update selected datasets',self.start_selected_archive_sync))
         v.addWidget(self.label('Zeitraum: Von/Bis auf der Exportseite. Fehlgeschlagene oder fehlende Daten werden ausgewiesen. Große Erstbefüllungen können lange dauern. Die bestehende Abrufpause gilt auch hier.',
                                'Dates: From/Through on the Export tab. Failed or missing data is reported. Large initial downloads can take a long time. Existing request pauses also apply here.'))
@@ -478,8 +540,15 @@ class MainWindow(QMainWindow):
         self.add_tab(self.offline_widget,'Offline-Daten','Offline data');self.offline_source_changed()
 
     def ensure_archive_path(self):
-        if not self.archive_path.text().strip() and self.identity:
-            self.archive_path.setText(str(Path(self.output.text()).expanduser()/('account-'+self.identity)/'garmin-offline.sqlite'))
+        if not self.identity:return
+        expected=account_root(self.output.text(),self.identity)/'garmin-offline.sqlite'
+        current=self.archive_path.text().strip()
+        managed=False
+        if current:
+            path=Path(current).expanduser().resolve()
+            managed=(path.name=='garmin-offline.sqlite' and re.fullmatch(r'account-[a-f0-9]{20}',path.parent.name)
+                     and path.parent.name!='account-'+self.identity and not self.use_offline.isChecked())
+        if not current or managed:self.archive_path.setText(str(expected))
 
     def choose_archive(self):
         self.ensure_archive_path()
@@ -496,8 +565,25 @@ class MainWindow(QMainWindow):
             try:
                 with Archive(self.archive_path.text(),readonly=True) as db:
                     keys=activity_type_keys(db.snapshot('activity_types'))
+                    account=db.account
+                if hasattr(self,'data_page'):self.activate_date_account(account)
                 if keys:self.sport_keys=keys;self.sports_loaded=True;self.populate_sports();self.update_sports_hint()
             except Exception:pass
+        elif not offline and self.identity and self.date_account!=self.identity:
+            self.activate_date_account(self.identity)
+
+    def retrieve_skipped(self):
+        from repairs import repair_plan,RepairSync
+        if not self.api:
+            self.message('Zum Nachladen bitte anmelden.','Please sign in to retrieve data.');return
+        try:
+            p=replace(self.make_plan(for_sync=True),skip_empty=False,refresh_days=0,account=self.identity,expert_method='')
+            tasks=repair_plan(p.archive_path,self.identity,3,None,p)
+            if not tasks:
+                self.message('Keine übersprungenen Abfragen im gewählten Zeitraum.','No skipped requests in the selected date range.');return
+            self.run_worker(lambda w:RepairSync(self.api,p,w.cancel,lambda *a:w.event.emit(a)).run_tasks(tasks),self.archive_sync_done)
+        except Exception as exc:
+            text=self.error_description(diagnostic(exc));self.message(text,text)
 
     def start_selected_archive_sync(self):self.start_archive_sync(selected_only=True)
 
@@ -532,6 +618,7 @@ class MainWindow(QMainWindow):
         s=report['stats']
         text=self.tr(f"Offline-Datenbank: {s['downloaded']} neue Antworten, {s['cached']} wiederverwendet, {s['errors']} Fehler.",
                      f"Offline database: {s['downloaded']} new responses, {s['cached']} reused, {s['errors']} errors.")
+        if s.get('not_requested'):text+=self.tr(f" Ungeprüft übersprungen: {s['not_requested']}.",f" Skipped, unverified: {s['not_requested']}.")
         if s.get('skipped'):text+=self.tr(f" {s['skipped']} Tage nach abgelehnter Abfrageart übersprungen (als fehlend vermerkt).",f" {s['skipped']} days skipped after a rejected query type (recorded as missing).")
         if report['cancelled']:text+='\n'+self.tr('Abgebrochen. Bereits gespeicherte Daten bleiben erhalten.','Stopped. Responses already saved remain available.')
         elif not report['completed']:text+='\n'+self.tr('Der Bestand ist unvollständig. Übersicht und Fehlermeldungen prüfen.','The archive is incomplete. Check coverage and errors.')
@@ -551,15 +638,15 @@ class MainWindow(QMainWindow):
         self.archive_summary.setText(self.tr('Gespeicherter Bestand im gewählten Zeitraum: ','Stored data in the selected date range: ')+result['path']+' · '+start+' – '+end+'\n'+self.tr('Gespeicherte Tage sind keine Garantie für vollständige Messreihen. Fehlende Tage werden nicht online ergänzt.','Stored days do not guarantee complete measurement timelines. Missing days are not fetched online.'))
         actual={r['dataset']:r for r in result['coverage']}
         keys=[d.key for d in DATASETS]+[k for k in actual if k not in {d.key for d in DATASETS}]
-        headers=self.tr(['Datenart','Tage gespeichert','Tage fehlen','Antworten','Leere Antworten','Offene Fehler','Erster Tag','Letzter Tag','Letzter Abruf (UTC)'],
-                        ['Dataset','Days stored','Days missing','Responses','Empty responses','Unresolved errors','First day','Last day','Last fetch (UTC)'])
+        headers=self.tr(['Datenart','Tage gespeichert','Ungeprüft übersprungen (Tage)','Tage fehlen','Antworten','Leere Antworten','Offene Fehler','Erster Tag','Letzter Tag','Letzter Abruf (UTC)'],
+                        ['Dataset','Days stored','Unverified skipped days','Days missing','Responses','Empty responses','Unresolved errors','First day','Last day','Last fetch (UTC)'])
         self.coverage_table.clear();self.coverage_table.setColumnCount(len(headers));self.coverage_table.setHorizontalHeaderLabels(headers);self.coverage_table.setRowCount(len(keys))
         definitions={d.key:d for d in all_definitions()};n=(date.fromisoformat(end)-date.fromisoformat(start)).days+1
         for i,key in enumerate(keys):
             r=actual.get(key,{});d=definitions.get(key)
             title=(d.de if self.lang=='de' else d.en) if d else {'activity_types':self.tr('Sportartenkatalog','Sport taxonomy'),'activity_extras':self.tr('Aktivitätsdetails / Originaldateien','Activity details / original files')}.get(key,key)
             missing=max(0,n-r.get('stored_days',0)) if d and d.kind!='account' else '—'
-            values=[title,r.get('stored_days',0),missing,r.get('responses',0),r.get('empty_responses',0),r.get('failed_requests',0),r.get('first_day',''),r.get('last_day',''),r.get('fetched_utc','')]
+            values=[title,r.get('stored_days',0),r.get('unverified_days',0),missing,r.get('responses',0),r.get('empty_responses',0),r.get('failed_requests',0),r.get('first_day',''),r.get('last_day',''),r.get('fetched_utc','')]
             for j,value in enumerate(values):self.coverage_table.setItem(i,j,QTableWidgetItem(str(value)))
         self.coverage_table.resizeColumnsToContents();self.coverage_table.setColumnWidth(0,280)
 
@@ -714,7 +801,8 @@ class MainWindow(QMainWindow):
         if not email:
             self.message('Bitte E-Mail-Adresse eingeben.','Please enter your email.'); return
         ident=account_key(email,china); session=self.data_dir/'sessions'/ident
-        detect_first=self.detect_first.isChecked() and not restore
+        known_first=self.date_values(ident).get('first_activity','')
+        detect_first=self.detect_first.isChecked() and not known_first
         self.password.clear();self._restoring=restore
         def op(worker):
             api=Garmin(email=email,password=password or None,is_cn=china,prompt_mfa=worker.ask_mfa,retry_attempts=0)
@@ -739,7 +827,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 sport_keys=[]  # An optional sport-list failure must not block a valid login.
                 optional_error=diagnostic(exc)
-            first='';first_error={}
+            first=known_first;first_error={}
             if detect_first and not optional_error and callable(getattr(api,'count_activities',None)):
                 try:
                     cancel=getattr(worker,'cancel',None)
@@ -757,6 +845,7 @@ class MainWindow(QMainWindow):
     def login_done(self,result):
         self._restoring=False
         self.api,self.identity,self._signed_email=result[:3]
+        self.activate_date_account(self.identity)
         if len(result)>6:
             persistence=result[6]
             if persistence['remember'] and persistence['saved']:
@@ -776,11 +865,16 @@ class MainWindow(QMainWindow):
         self.update_connection(); self.tabs.setCurrentIndex(1)
         if len(result)>4 and result[4]:
             first=QDate.fromString(result[4],'yyyy-MM-dd')
-            if first.isValid() and not self.date_user_set:
-                self.start_date.blockSignals(True);self.start_date.setDate(first);self.start_date.blockSignals(False)
+            if first.isValid() and QDate(1990,1,1)<=first<=QDate.currentDate():
+                self.first_activity_date=result[4];self.reset_start_button.setEnabled(True)
+                self.save_date_values(self.identity,first_activity=result[4])
+                if not self.date_user_set:
+                    self.start_date.blockSignals(True);self.start_date.setDate(first);self.start_date.blockSignals(False)
+                if self.data_page.date_account in (None,self.identity):self.data_page.restore_date_filter(self.identity)
             self.log.appendPlainText(self.tr('Älteste verfügbare Aktivität: ','Oldest available activity: ')+result[4])
         if len(result)>5 and result[5]:
             self.register_rate_limit(result[5]);self.log.appendPlainText(self.tr('Optionale Kontoabfrage nicht verfügbar: ','Optional account lookup unavailable: ')+self.error_description(result[5]))
+        if self.use_offline.isChecked():self.offline_source_changed()
 
     def forget(self):
         ident=self.identity or (account_key(self.email.text().strip(),self.china.isChecked()) if self.email.text().strip() else None)
@@ -812,12 +906,13 @@ class MainWindow(QMainWindow):
             activity_summary=self.activity_summary.isChecked(),language=self.lang,
             preview_rows=self.preview_rows.value(),preview_requests=self.preview_requests.value(),
             source='offline' if offline else 'online',archive_path=self.archive_path.text().strip(),optimize=self.optimize.isChecked(),activity_batch_days=self.activity_batch_days.value(),
-            health_detail=self.health_detail.currentData(),health_batch_days=self.health_batch_days.value(),workers=self.workers.value())
+            health_detail=self.health_detail.currentData(),health_batch_days=self.health_batch_days.value(),workers=self.workers.value(),export_history=self.export_history.isChecked(),skip_empty=self.skip_empty.isChecked())
 
     def show_export_preview(self):
         if not self.api and not self.use_offline.isChecked():
             self.tabs.setCurrentIndex(0); self.message('Bitte zuerst anmelden.','Please sign in first.'); return
         try:
+            if not self.use_offline.isChecked():self.ensure_archive_path()
             plan=self.make_plan(); plan.validate()
         except Exception as exc:
             if isinstance(exc,OfflineArchiveError):
@@ -890,6 +985,7 @@ class MainWindow(QMainWindow):
         if not self.api and not self.use_offline.isChecked():
             self.tabs.setCurrentIndex(0); self.message('Bitte zuerst anmelden.','Please sign in first.'); return
         try:
+            if not self.use_offline.isChecked():self.ensure_archive_path()
             plan=self.make_plan(); plan.validate()
             if not self.output.text().strip(): raise ValueError()
             if plan.expert_method and plan.source=='offline':
@@ -902,7 +998,7 @@ class MainWindow(QMainWindow):
                 text=self.error_description(diagnostic(exc));self.message(text,text);return
             self.message('Bitte Zeitraum, Kategorien, Formate, Aktivitätsauswahl und Expertenparameter prüfen. Start muss vor Ende liegen; Ende darf nicht in der Zukunft liegen.','Check dates, categories, formats, activity options and expert parameters. Start must not follow end; end must not be in the future.'); return
         self.completed=0; self.log.clear()
-        self.run_worker(lambda w:(OfflineExporter(plan,w.cancel,lambda *args:w.event.emit(args)) if plan.source=='offline' else Exporter(self.api,plan,w.cancel,lambda *args:w.event.emit(args))).run(),self.export_done,network=plan.source!='offline')
+        self.run_worker(lambda w:(OfflineExporter(plan,w.cancel,lambda *args:w.event.emit(args)) if plan.source=='offline' else ArchiveExporter(self.api,plan,w.cancel,lambda *args:w.event.emit(args))).run(),self.export_done,network=plan.source!='offline')
 
     def export_done(self,result):
         self.last_output,report=result; self.open_button.setEnabled(True)
@@ -913,12 +1009,14 @@ class MainWindow(QMainWindow):
         if 'activities' in report.get('config',{}).get('datasets',[]):
             self.log.appendPlainText(self.tr('Aktivitäten in der Liste: ','Activities in list: ')+str(s.get('activities',0)))
         text=self.tr(f"Neu: {s['downloaded']} · Cache: {s['cached']} · Leere Antworten: {s['empty']} · Abruffehler: {s['errors']}",f"Downloaded: {s['downloaded']} · Cached: {s['cached']} · Empty responses: {s['empty']} · Retrieval errors: {s['errors']}")
+        if s.get('not_requested'):text+=self.tr(f" · Ungeprüft übersprungen: {s['not_requested']}",f" · Skipped, unverified: {s['not_requested']}")
         self.log.appendPlainText(text+'\n'+self.last_output)
         if report.get('fatal_diagnostic'):
             text+='\n'+self.error_description(report['fatal_diagnostic'])
         elif report['fatal_error_type'] or report['export_error_type']:
             text+='\n'+self.tr('Lauf oder Ausgabe fehlgeschlagen: ','Run or output failed: ')+(report['fatal_error_type'] or report['export_error_type'])
         elif report['cancelled']: text+='\n'+self.tr('Abgebrochen. Geladene Daten wurden ausgegeben.','Stopped. Retrieved data was exported.')
+        elif s.get('not_requested'):text+='\n'+self.tr('Export enthält ungeprüft übersprungene Abfragen. Bei Bedarf unter Offline-Daten nachladen.','Export contains unverified skipped requests. Retrieve them under Offline data if needed.')
         elif s['errors']: text+='\n'+self.tr('Mit Abruffehlern beendet. Bericht prüfen.','Finished with retrieval errors. Check report.')
         else: text+='\n'+self.tr('Export beendet. Datenumfang im Bericht prüfen.','Export finished. Check coverage in the report.')
         self.message(text,text)
@@ -936,6 +1034,9 @@ class MainWindow(QMainWindow):
             if values[0]=='planning':self.eta_label.setText(self.tr('Download wird geplant · vorhandene Daten werden geprüft …','Planning download · checking existing data …'))
             elif values[0]=='offline':
                 self.local_transfer=True;self.eta_label.setText(self.tr('Lokaler Export · keine Garmin-Abfragen','Local export · no Garmin requests'))
+        elif kind=='plan':
+            info=values[0]
+            self.log.appendPlainText(self.tr(f"Geplant: {info['requests']} offene Abrufe, {info['stored']} gespeicherte Jobs; Aktivitätszusätze folgen.",f"Planned: {info['requests']} open requests, {info['stored']} stored jobs; activity extras follow."))
         elif kind=='batch':self.log.appendPlainText(self.tr('Zeitraumabruf','Range request')+f': {values[0]} · {values[1]} … {values[2]}')
         elif kind=='batch_fallback':self.log.appendPlainText(self.tr('Zeitraum nicht vollständig nutzbar; tagweise fortgesetzt: ','Range not usable; continuing daily: ')+values[0])
         elif kind=='total': self.progress.setRange(0,max(1,values[0])); self.progress.setValue(0)
@@ -948,7 +1049,7 @@ class MainWindow(QMainWindow):
             self.log.appendPlainText(self.tr('Hinweis: Sportartenhierarchie nicht verfügbar; es wird nur die genaue Sportart berücksichtigt.', 'Warning: sport hierarchy unavailable; matching the exact sport type only.'))
         elif kind in ('item','error'):
             key,day,status=values
-            status={'cached':self.tr('Cache','Cached'),'downloaded':self.tr('Geladen','Downloaded'),'offline':self.tr('Offline gespeichert','Stored offline')}.get(status,status)
+            status={'cached':self.tr('Cache','Cached'),'downloaded':self.tr('Geladen','Downloaded'),'not_requested':self.tr('Ungeprüft übersprungen (Regel)','Skipped, unverified (rule)'),'offline':self.tr('Offline gespeichert','Stored offline')}.get(status,status)
             self.log.appendPlainText(f'{day} · {key} · {status}')
         elif kind=='import':
             self.status.setText(self.tr(f'Import: {values[0]} neu · {values[1]} Duplikate · {values[2]} Fehler',f'Import: {values[0]} new · {values[1]} duplicates · {values[2]} errors'))
@@ -1029,8 +1130,10 @@ class MainWindow(QMainWindow):
                 for key,cb in checks.items():cb.setChecked(key in values)
             self.layout_combo.setCurrentIndex(self.layout_combo.findData(p.layout)); self.delimiter.setCurrentIndex(self.delimiter.findData(p.delimiter))
             self.archive_path.setText(p.archive_path);self.use_offline.setChecked(p.source=='offline');self.activity_summary.setChecked(p.activity_summary); self.preview_rows.setValue(p.preview_rows); self.preview_requests.setValue(p.preview_requests); self.split.setChecked(p.split_year); self.delay.setValue(p.delay); self.refresh.setValue(p.refresh_days); self.retries.setValue(p.retries); self.set_sport(p.activity_type)
+            self.skip_empty.setChecked(p.skip_empty)
             self.optimize.setChecked(p.optimize);self.activity_batch_days.setValue(p.activity_batch_days)
             self.health_detail.setCurrentIndex(self.health_detail.findData(p.health_detail));self.health_batch_days.setValue(p.health_batch_days)
+            self.export_history.setChecked(p.export_history)
             if 'workers' in settings:self.workers.setValue(p.workers)  # Older presets keep the current value.
             self.selectors.setPlainText('\n'.join(p.selectors));self.expert_enable.setChecked(bool(p.expert_method));self.method.setCurrentText(p.expert_method or 'get_naps');self.kwargs.setPlainText(json.dumps(p.expert_kwargs,indent=2));self.expert_daily.setChecked(p.expert_daily)
         except Exception: self.message('Vorlage ungültig oder nicht lesbar.','Preset is invalid or unreadable.')

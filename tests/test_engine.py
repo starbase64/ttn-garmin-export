@@ -43,8 +43,6 @@ def test_leaf_paths_preserve_types_and_empty():
 def test_resume_and_format_change_without_redownload(tmp_path):
     a=Exporter(DemoGarmin(),plan(tmp_path,formats=['csv','json','xlsx'])); dest,report=a.run()
     assert report['stats']['downloaded']==2 and report['completed']
-    b=Exporter(DemoGarmin(),plan(tmp_path,formats=['json'])); _,r=b.run()
-    assert r['stats']['cached']==2 and r['stats']['downloaded']==0
     source=json.loads(next(Path(dest).glob('summary-*.json')).read_text())
     assert source[0]['data']['missingExample'] is None
     with next(Path(dest).glob('summary-*.csv')).open(encoding='utf-8-sig',newline='') as f:
@@ -55,6 +53,9 @@ def test_resume_and_format_change_without_redownload(tmp_path):
     assert workbook.active.max_row is None or workbook.active.max_row>2
     assert len(list(workbook.active.values))>2
     workbook.close()
+    b=Exporter(DemoGarmin(),plan(tmp_path,formats=['json'])); again,r=b.run()
+    assert again==dest and r['stats']['cached']==2 and r['stats']['downloaded']==0
+    assert not list(Path(dest).glob('*.csv')) and not list(Path(dest).glob('*.xlsx'))
 
 
 def test_account_isolation_and_filters_do_not_change_json(tmp_path):

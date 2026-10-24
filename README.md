@@ -2,11 +2,15 @@
 
 Lokale Windows-App zum Exportieren und Durchsuchen deiner Garmin-Connect-Daten. Deutsch/Englisch umschaltbar. Unabhängiges Community-Projekt; kein offizielles Garmin-Produkt.
 
-## Quellstand 0.5.1-preview: schnellere Downloads
+## Quellstand 0.5.3-preview: schnellere Downloads
 
 Der aktuelle Quellstand bietet 1–8 parallele Abfragen (Standard 3), gemeinsamer Mindestabstand von 0,5 Sekunden statt der bisherigen festen 2 Sekunden bei Sicherungen, begrenzte Wiederholungen und Erhalt erfolgreich geladener Antworten bei Abbruch. Garmin kann weiterhin Tagesabfragen und Ratenlimits erfordern; eine allgemeingültige Beschleunigung um einen festen Faktor ist nicht belegt.
 
 Außerdem: automatische Wiederherstellung gemerkter Sitzungen (nach dem Update einmal mit gesetztem Haken anmelden), Restzeit für parallele Downloads und eine Datenansicht mit großer Karte rechts. „Anleitung“ ist der letzte Reiter. Das bestehende Release `v0.5.0-preview` enthält diese Änderungen noch nicht; aktuelle Windows-Starter entstehen als Artefakte der [Actions-Prüfläufe](https://github.com/starbase64/ttn-garmin-export/actions).
+
+Neu in 0.5.3: ein aktueller Export pro Account unter `exports/current`, optionale getrennte Ergebnisordner und ein gemeinsamer SQLite-Bestand für Online-Export und Offline-Sicherung. Neue Ordner bedeuten keine neuen Downloads. Alte Ergebnisordner bleiben erhalten.
+
+Neu in 0.5.2: Das ermittelte erste Aktivitätsdatum und die gewählten Anfangsdaten auf Export und Daten werden pro Konto gespeichert. Ein Zurücksetzen-Button verwendet das gemerkte Kontodatum ohne neue Garmin-Anfrage.
 
 Optional: Tages-Wellness-ZIPs unverändert sichern. Diese Rohdateien werden derzeit nicht in CSV/Excel umgewandelt und ersetzen JSON-Abfragen nicht automatisch. Anleitung in der App erklärt die Auswahl.
 

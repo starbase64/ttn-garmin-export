@@ -65,7 +65,7 @@ def test_oldest_activity_suggestion_is_bounded_and_preserves_user_date(monkeypat
         def count_activities(self):calls.append('count');return 9876
         def get_activities(self,start,limit):calls.append((start,limit));return [{'startTimeLocal':'2011-06-01 12:00:00'}]
     monkeypatch.setattr(module,'Garmin',API)
-    window=MainWindow();window.email.setText('test@example.invalid');window.message=lambda *a:None
+    window=MainWindow();window.data_dir=tmp_path;window.email.setText('test@example.invalid');window.message=lambda *a:None
     window.run_worker=lambda op,done:done(op(SimpleNamespace(ask_mfa=lambda:'000000')))
     window.login();assert window.start_date.date()==QDate(2011,6,1)
     assert calls==['count',(9875,1)]

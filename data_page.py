@@ -27,6 +27,7 @@ class DataPage(QWidget):
     def __init__(self,host):
         super().__init__();self.host=host;self.data={'activities':[],'tracks':{},'health':[]};self.by_key={};self.visible=[];self.summary_rows=[]
         self.loading=False;self.filter_initialized=False;self.presets_path=host.data_dir/'data-view-presets.json'
+        self.date_account=None;self.first_activity_date=None
         self.track_worker=None;self.track_generation=0;self.pending_tracks=[]
         self.persisted_columns=[]
         outer=QVBoxLayout(self);outer.setContentsMargins(0,0,0,0)
@@ -61,6 +62,9 @@ class DataPage(QWidget):
             d.setCalendarPopup(True);d.setDisplayFormat('yyyy-MM-dd');d.setDateRange(QDate(1990,1,1),QDate.currentDate())
             dates.addWidget(label);dates.addWidget(d,1)
         v.addLayout(dates)
+        self.reset_date_button=host.button('Auf erste Aktivität zurücksetzen','Reset to first activity',self.reset_activity_start)
+        self.reset_date_button.setEnabled(False);v.addWidget(self.reset_date_button)
+        host.bind(self.reset_date_button,'Setzt den Anfang auf das gespeicherte erste Aktivitätsdatum dieses Kontos zurück. Wird nach dessen Ermittlung verfügbar.','Reset start to this account’s saved first activity date. Available after it has been detected.',setter='setToolTip')
         self.min_km=QDoubleSpinBox();self.min_km.setRange(0,100000);self.min_km.setSuffix(' km')
         extra=QHBoxLayout();extra.addWidget(host.label('Mindestdistanz','Minimum distance'));extra.addWidget(self.min_km)
         extra.addWidget(host.button('Spalten','Columns',self.column_menu))
@@ -98,11 +102,35 @@ class DataPage(QWidget):
         self.trend_note=host.label('Auswertung der aktuell gefilterten Aktivitäten; fehlende Messwerte zählen nicht als gemessene Null.','Summary of currently filtered activities; missing readings do not represent measured zero.');tv.addWidget(self.trend_note)
         self.trends=QTableWidget();self.trends.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers);tv.addWidget(self.trends,1);self.views.addTab(trends,'')
         self.search.textChanged.connect(self.apply_filters);self.sport.currentIndexChanged.connect(self.apply_filters);self.date_from.dateChanged.connect(self.apply_filters);self.date_to.dateChanged.connect(self.apply_filters);self.min_km.valueChanged.connect(self.apply_filters)
+        self.date_from.dateChanged.connect(self.remember_date_filter)
         self.period.currentIndexChanged.connect(self.refresh_summaries);self.heat.toggled.connect(self.selection_changed);self.online.toggled.connect(self.map.set_online);self.privacy.valueChanged.connect(self.selection_changed)
         host.archive_path.textChanged.connect(self.source.setText)
         self.retranslate();self.read_presets()
 
     def t(self,de,en):return self.host.tr(de,en)
+    def restore_date_filter(self,account,apply=True):
+        if self.date_account!=account:
+            self.filter_initialized=False
+            self.date_from.blockSignals(True);self.date_from.setDate(QDate(1990,1,1));self.date_from.blockSignals(False)
+        self.date_account=account;values=self.host.date_values(account)
+        self.first_activity_date=values.get('first_activity')
+        self.reset_date_button.setEnabled(bool(self.first_activity_date))
+        chosen=values.get('data_from') or self.first_activity_date
+        if chosen:
+            self.date_from.blockSignals(True);self.date_from.setDate(QDate.fromString(chosen,'yyyy-MM-dd'));self.date_from.blockSignals(False)
+            self.filter_initialized=True
+        if apply:self.apply_filters()
+
+    def remember_date_filter(self,*args):
+        self.filter_initialized=True
+        self.host.save_date_values(self.date_account,data_from=self.date_from.date().toString('yyyy-MM-dd'))
+
+    def reset_activity_start(self):
+        if not self.first_activity_date:return
+        first=QDate.fromString(self.first_activity_date,'yyyy-MM-dd')
+        if self.date_to.date()<first:self.date_to.setDate(first)
+        self.date_from.setDate(first)
+        self.host.save_date_values(self.date_account,data_from=self.first_activity_date)
     def error(self,exc):
         # Class only: import errors and paths must not leak server data or credentials.
         self.host.message(self.t('Vorgang fehlgeschlagen: ','Operation failed: ')+type(exc).__name__,self.t('Vorgang fehlgeschlagen: ','Operation failed: ')+type(exc).__name__)
@@ -121,6 +149,8 @@ class DataPage(QWidget):
         self.track_generation+=1
         if self.track_worker and self.track_worker.isRunning():self.track_worker.cancel.set()
         self.data=data;self.by_key={a['_key']:a for a in data['activities']}
+        account=data.get('account') or self.host.identity
+        if account:self.restore_date_filter(account,apply=False)
         current=self.sport.currentData();self.sport.blockSignals(True);self.sport.clear();self.sport.addItem(self.t('Alle Sportarten','All sports'),'')
         for key in sorted({(a.get('activityType') or {}).get('typeKey','other') for a in data['activities']}):self.sport.addItem(sport_label(key,self.host.lang)+' ('+key+')',key)
         self.sport.setCurrentIndex(max(0,self.sport.findData(current)));self.sport.blockSignals(False)

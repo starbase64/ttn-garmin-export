@@ -60,6 +60,8 @@ class RemainingTime:
     def observe_request(self,duration):
         self.network_samples.append(max(.0001,duration));self.measured+=1;self.emit()
     def add(self,family,count):self.pending[family]+=count;self.emit()
+    def skip(self,family):
+        self.pending[family]=max(0,self.pending[family]-1);self.emit()
     def begin(self,family):self.active=(family,self.clock());self.emit()
     def finish(self):
         if self.active:

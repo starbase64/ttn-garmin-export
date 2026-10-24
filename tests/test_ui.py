@@ -256,3 +256,62 @@ def test_full_archive_button_ignores_export_filters_and_selects_supported_data(t
     assert p.source=='online' and p.retries>=1 and p.delay>=app_module.MIN_SYNC_INTERVAL and p.workers==window.workers.value()
     assert p.activity_details==list(ACTIVITY_DETAILS) and p.activity_files==['ORIGINAL','GPX']
     window.close()
+
+
+def test_online_ui_reuses_archive_and_current_folder_and_exposes_history(tmp_path):
+    import threading
+    from types import SimpleNamespace
+    from PySide6.QtCore import QDate
+    from engine import Plan,account_key
+    from demo_data import DemoGarmin
+    from offline import ArchiveSync
+    ident=account_key('reuse@example.invalid');database=tmp_path/'data.sqlite'
+    p=Plan('2020-01-01','2020-01-01',['summary'],str(tmp_path/'output'),ident,
+           archive_path=str(database),delay=0,refresh_days=0)
+    assert ArchiveSync(DemoGarmin(),p).run_sync()['report']['completed']
+    class NoRequests:
+        def __getattr__(self,name):
+            def fail(*args,**kwargs):raise AssertionError('No Garmin traffic expected')
+            return fail
+    window=MainWindow();window.api=NoRequests();window.identity=ident;window._signed_email='reuse@example.invalid'
+    window.output.setText(p.output);window.archive_path.setText(str(database))
+    window.select_all(False);window.dataset_checks['summary'].setChecked(True)
+    window.start_date.setDate(QDate(2020,1,1));window.end_date.setDate(QDate(2020,1,1));window.refresh.setValue(0)
+    worker=SimpleNamespace(cancel=threading.Event(),event=SimpleNamespace(emit=lambda *args:None))
+    results=[];window.run_worker=lambda operation,done,network=True:results.append(operation(worker))
+    window.start_export();window.start_export()
+    assert results[0][1]['completed'] and results[1][1]['completed']
+    assert results[0][0]==results[1][0] and results[1][1]['stats']['downloaded']==0
+    assert results[1][1]['stats']['cached']==1
+    assert not window.make_plan().export_history
+    window.export_history.setChecked(True);assert window.make_plan().export_history
+    window.close()
+
+
+def test_account_switch_updates_managed_default_archive_without_changing_custom_path(tmp_path):
+    from engine import account_key,account_root
+    window=MainWindow();window.output.setText(str(tmp_path))
+    a=account_key('first@example.invalid');b=account_key('second@example.invalid')
+    window.identity=a;window.ensure_archive_path()
+    first=window.archive_path.text()
+    assert first==str(account_root(tmp_path,a)/'garmin-offline.sqlite')
+    window.identity=b;window.ensure_archive_path()
+    assert window.archive_path.text()==str(account_root(tmp_path,b)/'garmin-offline.sqlite')
+    custom=str(tmp_path/'my-custom.sqlite');window.archive_path.setText(custom)
+    window.identity=a;window.ensure_archive_path()
+    assert window.archive_path.text()==custom
+    window.close()
+
+
+def test_inferred_skip_option_and_recovery_button_are_bilingual():
+    from PySide6.QtWidgets import QPushButton
+    window=MainWindow(demo=True)
+    assert not window.skip_empty.isChecked() and not window.make_plan().skip_empty
+    window.skip_empty.setChecked(True)
+    assert window.make_plan().skip_empty
+    assert any(b.text()=='Übersprungene Abfragen trotzdem laden' for b in window.findChildren(QPushButton))
+    window.toggle_language()
+    assert window.make_plan().skip_empty
+    assert any(b.text()=='Retrieve skipped requests anyway' for b in window.findChildren(QPushButton))
+    assert 'Experimental' in window.help.toPlainText()
+    window.close()

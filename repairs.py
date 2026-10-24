@@ -14,7 +14,14 @@ def repair_plan(path,account,mode,selected,plan):
         if token not in seen:
             seen.add(token);tasks.append((key,day,method,args,kwargs or {},fmt))
     with Archive(path,account,readonly=True) as db:
-        if mode==0:
+        if mode==3:
+            allowed={d.method for d in all_definitions()}|set(ACTIVITY_DETAILS)
+            if db.has_inferred_skips:
+                for row in db.db.execute('SELECT * FROM inferred_skips WHERE day BETWEEN ? AND ? ORDER BY day,dataset',(plan.start,plan.end)):
+                    request=__import__('json').loads(row['request_json'])
+                    if request['method'] in allowed and not request.get('binary'):
+                        add(row['dataset'],row['day'],request['method'],tuple(request['args']),request['kwargs'])
+        elif mode==0:
             from datahub import track_from_archive
             for a in selected:
                 if str(a.get('activityId','')).isdigit() and not track_from_archive(db,a):
